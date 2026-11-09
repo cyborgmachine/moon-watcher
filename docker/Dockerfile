@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.15-slim-bookworm
 
 LABEL org.opencontainers.image.title="Moon Watcher" \
       org.opencontainers.image.description="Telegram bot for monitoring websites, domains, Docker containers and VPS resources" \
