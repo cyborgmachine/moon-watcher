@@ -1,0 +1,83 @@
+services:
+  # PostgreSQL
+  postgres:
+    image: postgres:16-alpine
+    container_name: moon-watcher-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-moon_watcher}
+      POSTGRES_USER: ${DB_USER:-watcher}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - bot_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-watcher} -d ${DB_NAME:-moon_watcher}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Moon Watcher
+  moon-watcher:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: moon-watcher
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Point at the compose service name regardless of what .env says
+      DB_HOST: postgres
+    # Docker monitoring reads container state/stats through the Docker socket.
+    # ":ro" does not limit the Docker API, socket access is effectively root on the host.
+    # See SECURITY.md for a socket-proxy alternative.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Optional, for exact host disk numbers (also set HOST_DISK_PATH=/hostfs in .env):
+      # - /:/hostfs:ro
+    group_add:
+      - "${DOCKER_GID:-999}"   # stat -c '%g' /var/run/docker.sock
+    networks:
+      - bot_network
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    cap_drop:
+      - ALL
+
+networks:
+  bot_network:
+    driver: bridge
+
+volumes:
+  pgdata:
