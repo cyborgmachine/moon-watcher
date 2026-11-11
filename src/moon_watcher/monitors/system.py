@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Host CPU / RAM / swap / disk / load monitoring with threshold alerts."""
 
 import logging
@@ -16,8 +15,9 @@ from moon_watcher.config import (
     THRESHOLD_DISK,
     THRESHOLD_RAM,
 )
-from moon_watcher.utils.fmt import bar, fmt_bytes, fmt_duration, level_icon
 from moon_watcher.notifier import TelegramNotifier
+from moon_watcher.store import Saved
+from moon_watcher.utils.fmt import bar, fmt_bytes, fmt_duration, level_icon
 from moon_watcher.utils.thresholds import SustainedThreshold
 
 logger = logging.getLogger(__name__)
@@ -69,14 +69,13 @@ class SystemMonitor:
     def __init__(self, notifier: TelegramNotifier):
         self.notifier = notifier
         self._tracker = SustainedThreshold(RESOURCE_ALERT_CHECKS)
+        self._store = Saved("host_thresholds")
+
+    def load_state(self) -> None:
+        self._tracker.restore(self._store.load([]))
 
     def check(self) -> dict:
         m = collect_host_metrics()
-
-        try:
-            db.save_host_metrics(m)
-        except Exception as e:  # DB trouble must never block alerts
-            logger.error("Failed to save host metrics: %s", e)
 
         checks = (
             ("cpu", "CPU", m["cpu_percent"], THRESHOLD_CPU, ""),
@@ -104,6 +103,12 @@ class SystemMonitor:
                     f"✅ <b>{label} back to normal</b>: {value:.1f}% (threshold {threshold}%)",
                     site_url="host", event_type=f"{key}_ok", cooldown=False,
                 )
+
+        self._store.save(self._tracker.alerted())
+        try:
+            db.save_host_metrics(m)
+        except Exception as e:
+            logger.error("Failed to save host metrics: %s", e)
         return m
 
     @staticmethod

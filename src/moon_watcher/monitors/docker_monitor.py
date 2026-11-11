@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 """Docker container monitoring: state, health, restarts, resource usage."""
 
 import fnmatch
 import logging
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html import escape
@@ -21,7 +21,8 @@ from moon_watcher.config import (
     THRESHOLD_CONTAINER_MEM,
 )
 from moon_watcher.utils.fmt import bar, fmt_bytes, fmt_duration, level_icon, parse_docker_ts
-from moon_watcher.notifier import TelegramNotifier
+from moon_watcher.notifier import Alert, TelegramNotifier
+from moon_watcher.store import Saved
 from moon_watcher.utils.thresholds import SustainedThreshold
 
 logger = logging.getLogger(__name__)
@@ -122,15 +123,26 @@ def _state_text(info: dict) -> str:
     return text
 
 
+def _nothing() -> None:
+    pass
+
+
 class DockerMonitor:
     def __init__(self, notifier: TelegramNotifier):
         self.notifier = notifier
         self.last_error: str | None = None
         self._client: docker.DockerClient | None = None
         self._check_lock = threading.Lock()
-        self._prev: dict[str, dict] = {}  # container name -> {"status", "started_at"}
+        # container name -> {"id", "status", "started_at", "alerted"}
+        self._prev: dict[str, dict] = {}
         self._res = SustainedThreshold(RESOURCE_ALERT_CHECKS)
         self._daemon_down = False
+        self._state_store = Saved("docker_containers")
+        self._res_store = Saved("docker_thresholds")
+
+    def load_state(self) -> None:
+        self._prev = self._state_store.load({})
+        self._res.restore(self._res_store.load([]))
 
     def _get_client(self) -> docker.DockerClient:
         if self._client is None:
@@ -208,7 +220,7 @@ class DockerMonitor:
             running = [i for i in infos if i["state"] == "running"]
             if running:
                 with ThreadPoolExecutor(max_workers=8) as pool:
-                    for info, stats in zip(running, pool.map(self._fetch_stats, running)):
+                    for info, stats in zip(running, pool.map(self._fetch_stats, running), strict=True):
                         info["stats"] = stats
         return infos
 
@@ -238,8 +250,7 @@ class DockerMonitor:
 
             if infos is None:
                 if not self._daemon_down:
-                    self._daemon_down = True
-                    self.notifier.send_alert(
+                    self._daemon_down = self.notifier.send_alert(
                         "🚨 <b>Docker is unreachable</b>\n\n"
                         f"<code>{escape(self.last_error or 'unknown error')}</code>\n"
                         "Check the socket mount and DOCKER_GID.",
@@ -248,52 +259,75 @@ class DockerMonitor:
                     db.log_event("ERROR", "docker", f"Docker unreachable: {self.last_error}")
                 return
             if self._daemon_down:
-                self._daemon_down = False
-                self.notifier.send_alert("✅ <b>Docker is reachable again</b>",
-                                         site_url="docker", event_type="docker_daemon_ok", cooldown=False)
+                self._daemon_down = not self.notifier.send_alert(
+                    "✅ <b>Docker is reachable again</b>",
+                    site_url="docker", event_type="docker_daemon_ok", cooldown=False,
+                )
 
+            outbox: list[tuple[Alert, Callable[[], None]]] = []
+            events: list[tuple[str, str, str]] = []
+            self._process_states(infos, outbox, events)
+            self._process_resources(infos, outbox, events)
+
+            if outbox:
+                delivered = self.notifier.send_alerts([alert for alert, _ in outbox])
+                for (_, on_sent), ok in zip(outbox, delivered, strict=True):
+                    if ok:
+                        on_sent()
+
+            self._state_store.save(self._prev)
+            self._res_store.save(self._res.alerted())
+            for level, message, name in events:
+                db.log_event(level, "docker", message, name)
             try:
                 db.save_container_metrics(infos)
-            except Exception as e:  # DB trouble must never block alerts
+            except Exception as e:
                 logger.error("Failed to save container metrics: %s", e)
 
-            self._process_states(infos)
-            self._process_resources(infos)
-
-    def _process_states(self, infos: list[dict]) -> None:
+    def _process_states(self, infos: list[dict], outbox: list, events: list) -> None:
         seen = set()
         for i in infos:
             name = i["name"]
             seen.add(name)
             status = classify(i)
             prev = self._prev.get(name)
-            prev_status = prev["status"] if prev else None
+            entry = {"id": i["id"], "status": status, "started_at": i["started_at"], "alerted": False}
+            self._prev[name] = entry
 
-            if status in ("down", "unhealthy") and prev_status != status:
-                self._alert_problem(i, status)
-            elif status == "ok" and prev_status in ("down", "unhealthy"):
-                self.notifier.send_alert(
-                    f"✅ <b>Docker: container recovered</b>\n\n🐳 <b>{escape(name)}</b>\n"
-                    f"State: {escape(_state_text(i))}",
-                    site_url=f"docker:{name}", event_type="container_recovery", cooldown=False,
-                )
-                db.log_event("INFO", "docker", f"Container recovered: {name}", name)
-            elif status == "ok" and prev_status == "ok" and prev["started_at"] != i["started_at"]:
-                # Came back between two checks (restart policy, deploy, `docker restart`)
-                self.notifier.send_alert(
+            if status in ("down", "unhealthy"):
+                if prev and prev.get("status") == status:
+                    entry["alerted"] = prev.get("alerted", False)
+                if not entry["alerted"]:
+                    outbox.append((self._problem_alert(i, status), lambda e=entry: e.update(alerted=True)))
+                    if not prev or prev.get("status") != status:
+                        events.append(("ERROR", f"Container {status}: {_state_text(i)}", name))
+
+            elif status == "ok" and prev and prev.get("status") in ("down", "unhealthy"):
+                if prev.get("alerted"):
+                    outbox.append((Alert(
+                        f"✅ <b>Docker: container recovered</b>\n\n🐳 <b>{escape(name)}</b>\n"
+                        f"State: {escape(_state_text(i))}",
+                        f"docker:{name}", "container_recovery", cooldown=False,
+                    ), _nothing))
+                events.append(("INFO", f"Container recovered: {name}", name))
+
+            elif status == "ok" and prev and prev.get("status") == "ok" and prev.get("started_at") != i["started_at"]:
+                if prev.get("id") != i["id"]:
+                    # same name, new container: compose recreated it on deploy
+                    events.append(("INFO", f"Container recreated: {name}", name))
+                    continue
+                outbox.append((Alert(
                     f"🔄 <b>Docker: container restarted</b>\n\n🐳 <b>{escape(name)}</b>\n"
                     f"Restart count: {i['restart_count']}"
                     + ("\n💥 Previous run was OOMKilled" if i["oom"] else ""),
-                    site_url=f"docker:{name}", event_type="container_restart",
-                )
-                db.log_event("WARNING", "docker", f"Container restarted: {name}", name)
+                    f"docker:{name}", "container_restart",
+                ), _nothing))
+                events.append(("WARNING", f"Container restarted: {name}", name))
 
-            self._prev[name] = {"status": status, "started_at": i["started_at"]}
-
-        for gone in set(self._prev) - seen:  # removed containers
+        for gone in set(self._prev) - seen:
             del self._prev[gone]
 
-    def _alert_problem(self, i: dict, status: str) -> None:
+    def _problem_alert(self, i: dict, status: str) -> Alert:
         name = i["name"]
         head = "🚨 <b>Docker: container DOWN</b>" if status == "down" else \
                "🟠 <b>Docker: container UNHEALTHY</b>"
@@ -307,11 +341,10 @@ class DockerMonitor:
             logs = self.get_logs(i["id"], DOCKER_ALERT_LOG_LINES)
             if logs and logs.strip():
                 lines = [ln[:200] for ln in logs.strip().splitlines()[-DOCKER_ALERT_LOG_LINES:]]
-                msg += f"\n\n📜 <b>Last logs:</b>\n<pre>{escape(chr(10).join(lines))[-1500:]}</pre>"
-        self.notifier.send_alert(msg, site_url=f"docker:{name}", event_type=f"container_{status}", cooldown=False)
-        db.log_event("ERROR", "docker", f"Container {status}: {_state_text(i)}", name)
+                msg += f"\n\n📜 <b>Last logs:</b>\n<pre>{escape(chr(10).join(lines)[-1200:])}</pre>"
+        return Alert(msg, f"docker:{name}", f"container_{status}", cooldown=False)
 
-    def _process_resources(self, infos: list[dict]) -> None:
+    def _process_resources(self, infos: list[dict], outbox: list, events: list) -> None:
         valid: set[str] = set()
         for i in infos:
             s = i["stats"]
@@ -336,15 +369,14 @@ class DockerMonitor:
                         f"{level_icon(value)} {label}: {value:.1f}% {extra} (threshold {threshold}%)\n"
                         f"⏳ Above threshold for ~{minutes} min"
                     )
-                    if self.notifier.send_alert(msg, site_url=f"docker:{name}", event_type=f"{key}_high"):
-                        self._res.mark_alerted(k)
-                    db.log_event("WARNING", "docker", f"High {label}: {value:.1f}%", name)
+                    outbox.append((Alert(msg, f"docker:{name}", f"{key}_high"),
+                                   lambda k=k: self._res.mark_alerted(k)))
+                    events.append(("WARNING", f"High {label}: {value:.1f}%", name))
                 elif action == "recover":
-                    self.notifier.send_alert(
-                        f"✅ <b>Docker: {label} back to normal</b>\n\n"
-                        f"🐳 <b>{escape(name)}</b>: {value:.1f}%",
-                        site_url=f"docker:{name}", event_type=f"{key}_ok", cooldown=False,
-                    )
+                    outbox.append((Alert(
+                        f"✅ <b>Docker: {label} back to normal</b>\n\n🐳 <b>{escape(name)}</b>: {value:.1f}%",
+                        f"docker:{name}", f"{key}_ok", cooldown=False,
+                    ), _nothing))
         self._res.prune(valid)
 
     @staticmethod

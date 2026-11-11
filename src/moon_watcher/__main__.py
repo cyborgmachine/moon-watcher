@@ -1,3 +1,3 @@
-from moon_watcher.bot import main
+from moon_watcher.app import main
 
 main()

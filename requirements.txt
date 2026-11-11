@@ -1,7 +1,6 @@
 requests>=2.34.2,<3
 python-dotenv>=1.2.4,<2
 python-telegram-bot>=22.8,<23
-schedule>=1.2.2,<2
 python-whois>=0.9.6,<1
 psycopg2-binary>=2.9.13,<3
 defusedxml>=0.7.1,<1

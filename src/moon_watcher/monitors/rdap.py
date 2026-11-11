@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """RDAP lookups for domain expiry.
 
 Some registries (.dev and .app for example) don't run a normal port 43 whois,

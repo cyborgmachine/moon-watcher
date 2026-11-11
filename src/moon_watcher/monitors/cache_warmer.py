@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Warms the cache by visiting every URL listed in the sitemap."""
 
 import logging

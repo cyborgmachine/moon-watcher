@@ -34,7 +34,7 @@ RUN chmod +x entrypoint.sh
 
 USER botuser
 
-# The bot touches this file every 30s from its event loop; a stale file means it is stuck or dead
+# The watchdog thread touches this file every 15s and exits the process if the bot hangs
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import os,time; s=os.stat('/tmp/bot_healthy'); exit(0 if time.time()-s.st_mtime<120 else 1)" || exit 1
 

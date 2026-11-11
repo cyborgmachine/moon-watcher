@@ -1,17 +1,23 @@
-#!/usr/bin/env python3
-"""Domain expiry monitoring via WHOIS."""
+"""Domain expiry monitoring via RDAP / WHOIS."""
 
 import logging
+import time
 from datetime import datetime
+from html import escape
 
 import whois
 
 from moon_watcher import database as db
 from moon_watcher.monitors import rdap
-from moon_watcher.config import DOMAIN_ALERT_DAYS, MONITORED_DOMAINS
+from moon_watcher.config import DOMAIN_ALERT_DAYS, DOMAIN_ERROR_ALERT_AFTER, MONITORED_DOMAINS
 from moon_watcher.notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
+
+# whois servers rate-limit, don't hit them back to back
+LOOKUP_PAUSE = 2
+# domain_alerts level used to remember "lookups keep failing" was reported
+LOOKUP_FAILING = -1
 
 
 def days_label(days: int | None) -> str:
@@ -73,7 +79,7 @@ def lookup_domain(domain_name: str) -> dict:
         if rdap_record:
             return rdap_record
         problems.append(f"WHOIS: {e}")
-        raise LookupError("; ".join(problems))
+        raise LookupError("; ".join(problems)) from e
 
 
 class DomainMonitor:
@@ -146,25 +152,33 @@ class DomainMonitor:
 
     def check_all_domains(self) -> list[dict]:
         results = []
-        for domain in MONITORED_DOMAINS:
-            r = self.check_domain(domain)
-            if r:
-                results.append(r)
+        for n, domain in enumerate(MONITORED_DOMAINS):
+            if n:
+                time.sleep(LOOKUP_PAUSE)
+            results.append(self.check_domain(domain))
         return results
 
     def check_and_send_alerts(self) -> int:
         sent = 0
         for domain in MONITORED_DOMAINS:
             info = db.get_latest_domain_info(domain)
-            if not info or info.get("alert_status") in (None, "ok", "unknown", "error"):
+            if not info:
                 continue
+            if info.get("alert_status") in ("error", "unknown"):
+                error = info.get("error") or "no expiry date in the RDAP/WHOIS answer"
+                sent += self._report_failing_lookups(domain, error)
+                continue
+            if db.clear_domain_alert(domain, LOOKUP_FAILING):
+                self.notifier.send_alert(
+                    f"✅ <b>Domain check works again</b>\n\n🌐 {escape(domain)}",
+                    site_url=domain, event_type="domain_lookup_ok", cooldown=False,
+                )
 
             days = info.get("days_until_expiry")
-            if days is None:
+            if days is None or info.get("alert_status") in (None, "ok"):
                 continue
 
-            # Level 0 = already expired; otherwise the tightest matching threshold
-            # (5 days left -> 7, not 30).
+            # level 0 = already expired, otherwise the tightest threshold (5 days left -> 7, not 30)
             if days < 0:
                 level = 0
             else:
@@ -172,7 +186,7 @@ class DomainMonitor:
             if level is None or not db.should_send_domain_alert(domain, level):
                 continue
 
-            # Record only after Telegram accepted the message, so a failed send is retried
+            # recorded only after Telegram accepted it, so a failed send is retried next time
             if self._send_domain_alert(
                 domain, days, info.get("expiration_date"),
                 info.get("registrar") or "Unknown", level,
@@ -180,6 +194,23 @@ class DomainMonitor:
                 db.record_domain_alert(domain, level)
                 sent += 1
         return sent
+
+    def _report_failing_lookups(self, domain: str, error: str | None) -> int:
+        if db.domain_error_streak(domain, DOMAIN_ERROR_ALERT_AFTER) < DOMAIN_ERROR_ALERT_AFTER:
+            return 0
+        if not db.should_send_domain_alert(domain, LOOKUP_FAILING):
+            return 0
+        msg = (
+            f"⚠️ <b>Can't check domain expiry</b>\n\n"
+            f"🌐 <b>Domain:</b> {escape(domain)}\n"
+            f"❌ Last {DOMAIN_ERROR_ALERT_AFTER} lookups gave no expiry date\n"
+            f"<b>Error:</b> {escape(error or 'unknown')}\n\n"
+            f"Expiry alerts for this domain won't work until this is fixed."
+        )
+        if self.notifier.send_alert(msg, site_url=domain, event_type="domain_lookup_failing", cooldown=False):
+            db.record_domain_alert(domain, LOOKUP_FAILING)
+            return 1
+        return 0
 
     def _send_domain_alert(self, domain, days, exp_date, registrar, threshold) -> bool:
         if days is not None and days < 0:
@@ -196,10 +227,10 @@ class DomainMonitor:
         exp_str = exp_date.strftime("%Y-%m-%d") if exp_date else "Unknown"
         msg = (
             f"{icon} <b>{urgency}: Domain expiring!</b>\n\n"
-            f"🌐 <b>Domain:</b> {domain}\n"
+            f"🌐 <b>Domain:</b> {escape(domain)}\n"
             f"📅 <b>Expires:</b> {exp_str}\n"
             f"⏳ <b>Days left:</b> {days_label(days)}\n"
-            f"🏢 <b>Registrar:</b> {registrar}"
+            f"🏢 <b>Registrar:</b> {escape(registrar)}"
         )
         return self.notifier.send_alert(
             msg, site_url=domain, event_type=f"domain_expiry_{threshold}", cooldown=False
@@ -209,10 +240,10 @@ class DomainMonitor:
     def format_domain_report(domain_name: str) -> str:
         info = db.get_latest_domain_info(domain_name)
         if not info:
-            return f"No data for {domain_name}"
+            return f"No data for {escape(domain_name)} yet"
 
         if info.get("error"):
-            return f"❌ <b>Check failed</b>\n\n🌐 {domain_name}\n⚠️ {info['error']}"
+            return f"❌ <b>Check failed</b>\n\n🌐 {escape(domain_name)}\n⚠️ {escape(info['error'])}"
 
         status_map = {
             "expired": ("🔴", "EXPIRED"),
@@ -228,14 +259,14 @@ class DomainMonitor:
 
         text = (
             f"{icon} <b>Domain info</b>\n\n"
-            f"🌐 <b>Domain:</b> {domain_name}\n"
+            f"🌐 <b>Domain:</b> {escape(domain_name)}\n"
             f"📊 <b>Status:</b> {label}\n\n"
             f"<b>Dates:</b>\n"
             f"  Created: {fmt_dt(info.get('creation_date'))}\n"
             f"  Expires: {fmt_dt(info.get('expiration_date'))}\n"
             f"  Updated: {fmt_dt(info.get('updated_date'))}\n\n"
             f"⏳ <b>Days left:</b> {days_label(days)}\n"
-            f"🏢 <b>Registrar:</b> {info.get('registrar', '—')}\n"
+            f"🏢 <b>Registrar:</b> {escape(info.get('registrar') or '—')}\n"
             f"🔍 <b>Last check:</b> {fmt_dt(info.get('checked_at'))}"
         )
         return text
@@ -252,7 +283,7 @@ class DomainMonitor:
             ic = icon_map.get(r.get("alert_status", ""), "⚪")
             d = r.get("days_until_expiry")
             label = f"{d}d" if d is not None and d >= 0 else (r.get("alert_status") or "?").upper()
-            lines.append(f"{ic} {r['domain_name'][:30]} — {label}")
+            lines.append(f"{ic} {escape(r['domain_name'][:30])} — {label}")
 
         ok = sum(1 for r in rows if r.get("alert_status") == "ok")
         warn = sum(1 for r in rows if r.get("alert_status") == "warning")

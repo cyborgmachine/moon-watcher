@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Small formatting helpers shared by the monitors."""
 
 from datetime import datetime, timezone
