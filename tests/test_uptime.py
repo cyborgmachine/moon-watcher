@@ -1,6 +1,8 @@
-"""Uptime incident logic: confirmation, restart-safety, undelivered alerts."""
+"""Uptime incident logic: confirmation, restart safety, undelivered alerts, dead database."""
 
-from datetime import timedelta
+import threading
+import time
+from datetime import datetime, timezone
 from unittest import mock
 
 from moon_watcher.monitors import uptime as up
@@ -11,28 +13,45 @@ OFFLINE = {"status": "offline", "status_code": 0, "error": "Timeout", "response_
 
 
 class FakeDB:
-    """In-memory stand-in for the incident-related parts of database.py."""
+    """The incident part of database.py, kept in a dict."""
 
-    def __init__(self, incident=None):
-        self.incident = incident
-        self.saved = []
+    def __init__(self, open_incident=None):
+        self.open = {}
+        if open_incident:
+            self.open[URL] = {"id": 7, "site_url": URL, "started_at": datetime.now(timezone.utc),
+                              **open_incident}
+        self.down = False
+        self.saved = 0
+        self.next_id = 100
 
-    def save_uptime_check(self, *a, **k):
-        self.saved.append(a)
+    def _check(self):
+        if self.down:
+            raise up.db.DatabaseUnavailable("down")
 
-    def get_open_incident(self, url):
-        return dict(self.incident) if self.incident else None
+    def save_uptime_check(self, *a):
+        self._check()
+        self.saved += 1
 
-    def open_downtime_incident(self, url):
-        self.incident = {"id": 1, "alert_sent": False}
-        return 1
+    def get_open_incidents(self):
+        self._check()
+        return {k: dict(v) for k, v in self.open.items()}
+
+    def open_downtime_incident(self, url, started_at):
+        self._check()
+        if url not in self.open:
+            self.next_id += 1
+            self.open[url] = {"id": self.next_id, "site_url": url, "started_at": started_at, "alert_sent": False}
+        return self.open[url]["id"]
 
     def close_downtime_incident(self, url):
-        self.incident = None
-        return timedelta(seconds=125)
+        self._check()
+        self.open.pop(url, None)
 
     def mark_incident_alerted(self, incident_id):
-        self.incident["alert_sent"] = True
+        self._check()
+        for inc in self.open.values():
+            if inc["id"] == incident_id:
+                inc["alert_sent"] = True
 
     def log_event(self, *a, **k):
         pass
@@ -44,13 +63,11 @@ class FakeNotifier:
         self.sent = []
 
     def send_alert(self, text, site_url="", event_type="generic", cooldown=True):
-        self.sent.append((event_type, cooldown))
+        self.sent.append(event_type)
         return self.deliver
 
 
-def run(fake_db, notifier, probes, threshold=2):
-    """Run one check_site() with the given sequence of probe results."""
-    mon = up.UptimeMonitor(notifier)
+def check(mon, fake_db, probes, threshold=2):
     it = iter(probes)
     mon._probe = lambda url: next(it)
     with mock.patch.object(up, "db", fake_db), \
@@ -61,45 +78,110 @@ def run(fake_db, notifier, probes, threshold=2):
 
 def test_blip_is_not_reported():
     db, n = FakeDB(), FakeNotifier()
-    run(db, n, [OFFLINE, ONLINE])          # fails once, confirmation probe succeeds
-    assert n.sent == [] and db.incident is None
+    check(up.UptimeMonitor(n), db, [OFFLINE, ONLINE])
+    assert n.sent == [] and db.open == {}
 
 
 def test_confirmed_outage_alerts_once_then_recovers():
     db, n = FakeDB(), FakeNotifier()
-    run(db, n, [OFFLINE, OFFLINE])
-    run(db, n, [OFFLINE, OFFLINE])         # still down: no second alert
-    run(db, n, [ONLINE])
-    assert n.sent == [("downtime", False), ("recovery", False)]   # transitions bypass the cooldown
-    assert db.incident is None
+    mon = up.UptimeMonitor(n)
+    check(mon, db, [OFFLINE, OFFLINE])
+    check(mon, db, [OFFLINE, OFFLINE])
+    assert db.open[URL]["alert_sent"] is True
+    check(mon, db, [ONLINE])
+    assert n.sent == ["downtime", "recovery"]
+    assert db.open == {}
 
 
 def test_recovery_after_bot_restart_closes_incident():
-    db = FakeDB({"id": 7, "alert_sent": True})     # incident opened by the previous bot process
-    n = FakeNotifier()
-    run(db, n, [ONLINE])                           # brand-new monitor instance, no in-memory state
-    assert db.incident is None
-    assert n.sent == [("recovery", False)]
+    db, n = FakeDB({"alert_sent": True}), FakeNotifier()
+    check(up.UptimeMonitor(n), db, [ONLINE])
+    assert db.open == {} and n.sent == ["recovery"]
 
 
 def test_no_duplicate_alert_after_restart_while_still_down():
-    db = FakeDB({"id": 7, "alert_sent": True})
-    n = FakeNotifier()
-    run(db, n, [OFFLINE, OFFLINE])
+    db, n = FakeDB({"alert_sent": True}), FakeNotifier()
+    check(up.UptimeMonitor(n), db, [OFFLINE, OFFLINE])
     assert n.sent == []
 
 
 def test_undelivered_down_alert_is_retried():
     db, n = FakeDB(), FakeNotifier(deliver=False)
-    run(db, n, [OFFLINE, OFFLINE])
-    assert db.incident["alert_sent"] is False
+    mon = up.UptimeMonitor(n)
+    check(mon, db, [OFFLINE, OFFLINE])
+    assert db.open[URL]["alert_sent"] is False
     n.deliver = True
-    run(db, n, [OFFLINE, OFFLINE])
-    assert db.incident["alert_sent"] is True
-    assert [t for t, _ in n.sent] == ["downtime", "downtime"]
+    check(mon, db, [OFFLINE, OFFLINE])
+    assert db.open[URL]["alert_sent"] is True
+    assert n.sent == ["downtime", "downtime"]
 
 
 def test_threshold_one_alerts_immediately():
     db, n = FakeDB(), FakeNotifier()
-    run(db, n, [OFFLINE], threshold=1)
-    assert [t for t, _ in n.sent] == ["downtime"]
+    check(up.UptimeMonitor(n), db, [OFFLINE], threshold=1)
+    assert n.sent == ["downtime"]
+
+
+def test_alerts_work_while_database_is_down():
+    db, n = FakeDB(), FakeNotifier()
+    db.down = True
+    mon = up.UptimeMonitor(n)
+    check(mon, db, [OFFLINE, OFFLINE])
+    check(mon, db, [OFFLINE, OFFLINE])
+    check(mon, db, [ONLINE])
+    assert n.sent == ["downtime", "recovery"]
+
+
+def test_incident_reaches_database_once_it_is_back():
+    db, n = FakeDB(), FakeNotifier()
+    db.down = True
+    mon = up.UptimeMonitor(n)
+    check(mon, db, [OFFLINE, OFFLINE])
+    db.down = False
+    check(mon, db, [OFFLINE, OFFLINE])
+    assert db.open[URL]["alert_sent"] is True
+    assert n.sent == ["downtime"]
+
+
+def test_recovery_during_db_outage_closes_incident_later():
+    db, n = FakeDB(), FakeNotifier()
+    mon = up.UptimeMonitor(n)
+    check(mon, db, [OFFLINE, OFFLINE])
+    db.down = True
+    check(mon, db, [ONLINE])
+    assert URL in db.open
+    db.down = False
+    check(mon, db, [ONLINE])
+    assert db.open == {}
+    assert n.sent == ["downtime", "recovery"]
+
+
+def test_manual_and_scheduled_check_do_not_double_alert():
+    db, n = FakeDB(), FakeNotifier()
+    mon = up.UptimeMonitor(n)
+
+    def slow_probe(url):
+        time.sleep(0.05)
+        return OFFLINE
+
+    mon._probe = slow_probe
+    with mock.patch.object(up, "db", db), mock.patch.object(up, "UPTIME_FAIL_THRESHOLD", 1):
+        threads = [threading.Thread(target=mon.check_site, args=(URL,)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert n.sent == ["downtime"]
+    assert len(db.open) == 1
+
+
+def test_check_many_runs_every_site():
+    db, n = FakeDB(), FakeNotifier()
+    mon = up.UptimeMonitor(n)
+    mon._probe = lambda url: OFFLINE if "down" in url else ONLINE
+    urls = [f"https://site{i}.test" for i in range(6)] + ["https://down.test"]
+    with mock.patch.object(up, "db", db), mock.patch.object(up, "UPTIME_FAIL_THRESHOLD", 1):
+        results = mon.check_many(urls)
+    assert list(results) == urls
+    assert results["https://down.test"]["status"] == "offline"
+    assert mon.is_down("https://down.test") and not mon.is_down(urls[0])

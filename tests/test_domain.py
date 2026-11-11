@@ -10,13 +10,24 @@ from moon_watcher.monitors import domain as dom
 class FakeDB:
     def __init__(self, days):
         self.days = days
+        self.status = "warning"
+        self.error_streak = 0
         self.sent_levels = set()
         self.reset_calls = 0
         self.checks = []
 
     def get_latest_domain_info(self, d):
-        return {"alert_status": "warning", "days_until_expiry": self.days,
+        return {"alert_status": self.status, "days_until_expiry": self.days, "error": "whois timeout",
                 "expiration_date": datetime(2030, 1, 1), "registrar": None}
+
+    def domain_error_streak(self, d, limit):
+        return min(self.error_streak, limit)
+
+    def clear_domain_alert(self, d, level):
+        if level in self.sent_levels:
+            self.sent_levels.discard(level)
+            return True
+        return False
 
     def should_send_domain_alert(self, d, level):
         return level not in self.sent_levels
@@ -53,7 +64,8 @@ def monitor(days, deliver=True):
 def run_alerts(mon, db):
     with mock.patch.object(dom, "db", db), \
             mock.patch.object(dom, "MONITORED_DOMAINS", ["example.com"]), \
-            mock.patch.object(dom, "DOMAIN_ALERT_DAYS", [30, 14, 7, 3, 1]):
+            mock.patch.object(dom, "DOMAIN_ALERT_DAYS", [30, 14, 7, 3, 1]), \
+            mock.patch.object(dom, "DOMAIN_ERROR_ALERT_AFTER", 3):
         return mon.check_and_send_alerts()
 
 
@@ -95,3 +107,20 @@ def test_renewal_resets_alert_history():
             mock.patch.object(dom.whois, "whois", return_value=fake_whois):
         mon.check_domain("example.com")
     assert db.reset_calls == 1
+
+
+def test_failing_lookups_are_reported_once_and_cleared():
+    mon, db, n = monitor(None)
+    db.status = "error"
+    db.error_streak = 2
+    assert run_alerts(mon, db) == 0
+    db.error_streak = 3
+    assert run_alerts(mon, db) == 1
+    assert run_alerts(mon, db) == 0
+    assert n.sent == ["domain_lookup_failing"]
+
+    db.status, db.days = "ok", 300
+    run_alerts(mon, db)
+    assert n.sent == ["domain_lookup_failing", "domain_lookup_ok"]
+    run_alerts(mon, db)
+    assert len(n.sent) == 2

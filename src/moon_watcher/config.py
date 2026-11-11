@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Settings, all read from environment variables."""
 
 import os
@@ -16,7 +15,7 @@ def _int(name: str, default: int, minimum: int | None = None) -> int:
     try:
         value = int(raw)
     except ValueError:
-        raise SystemExit(f"Config error: {name} must be a number, got {raw!r}")
+        raise SystemExit(f"Config error: {name} must be a number, got {raw!r}") from None
     if minimum is not None and value < minimum:
         raise SystemExit(f"Config error: {name} must be at least {minimum}, got {value}")
     return value
@@ -32,7 +31,9 @@ def _int_list(name: str, default: str = "") -> list[int]:
         try:
             result.append(int(part))
         except ValueError:
-            raise SystemExit(f"Config error: {name} must be a comma-separated list of numbers, got {part!r}")
+            raise SystemExit(
+                f"Config error: {name} must be a comma-separated list of numbers, got {part!r}"
+            ) from None
     return result
 
 
@@ -64,8 +65,16 @@ USER_AGENT: str = os.getenv(
 # failed probes in a row before a site counts as down (1 = alert immediately)
 UPTIME_FAIL_THRESHOLD: int = _int("UPTIME_FAIL_THRESHOLD", 2, minimum=1)
 UPTIME_RETRY_DELAY: int = _int("UPTIME_RETRY_DELAY", 30)
+UPTIME_CONCURRENCY: int = _int("UPTIME_CONCURRENCY", 5, minimum=1)
 
 DOMAIN_ALERT_DAYS: list[int] = _int_list("DOMAIN_ALERT_DAYS", "30,14,7,3,1")
+# warn once when this many domain lookups in a row have failed
+DOMAIN_ERROR_ALERT_AFTER: int = _int("DOMAIN_ERROR_ALERT_AFTER", 3, minimum=1)
+
+# extra hosts to check besides the https sites from UPTIME_SITES / WARMUP_SITES, "host" or "host:port"
+SSL_HOSTS: list[str] = [h.strip() for h in os.getenv("SSL_HOSTS", "").split(",") if h.strip()]
+SSL_CHECK_INTERVAL: int = _int("SSL_CHECK_INTERVAL", 720, minimum=1)
+SSL_ALERT_DAYS: list[int] = _int_list("SSL_ALERT_DAYS", "14,7,3,1")
 
 DB_HOST: str = os.getenv("DB_HOST", "postgres")
 DB_PORT: int = _int("DB_PORT", 5432)
@@ -76,12 +85,16 @@ DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")
 # throttles repeating alerts (resource usage, restart loops); down/up and expiry alerts always go out
 ALERT_COOLDOWN: int = _int("ALERT_COOLDOWN", 900)
 
-LOG_RETENTION_DAYS: int = _int("LOG_RETENTION_DAYS", 30)
+LOG_RETENTION_DAYS: int = _int("LOG_RETENTION_DAYS", 30, minimum=1)
+# host/container metrics are only shown for the last 24h, no reason to keep them long
+METRICS_RETENTION_DAYS: int = _int("METRICS_RETENTION_DAYS", 3, minimum=1)
+
 
 def _env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
 
+SSL_MONITORING: bool = _env_bool("SSL_MONITORING", True)
 DOCKER_MONITORING: bool = _env_bool("DOCKER_MONITORING", True)
 # wildcards allowed, e.g. "tmp-*"
 IGNORED_DOCKER_CONTAINERS: list[str] = [

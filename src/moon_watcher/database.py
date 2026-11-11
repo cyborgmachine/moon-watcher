@@ -1,8 +1,9 @@
-#!/usr/bin/env python3
 """PostgreSQL access: connection pool, migrations, queries."""
 
 import logging
 import os
+import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any
@@ -11,37 +12,65 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
-from moon_watcher.config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+from moon_watcher.config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER
 
 logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations")
 
+POOL_SIZE = 10
+POOL_WAIT = 10
+CONNECT_TIMEOUT = 5
+STATEMENT_TIMEOUT_MS = 15_000
+CLEANUP_BATCH = 5000
+# after a lost connection, fail fast for a while instead of waiting on every call
+OUTAGE_BACKOFF = 30
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_slots = threading.BoundedSemaphore(POOL_SIZE)
+_down_until = 0.0
 
 
-def init_db(min_conn: int = 2, max_conn: int = 10) -> None:
-    """Create the connection pool and ensure schema exists."""
+class DatabaseBusy(Exception):
+    pass
+
+
+class DatabaseUnavailable(Exception):
+    pass
+
+
+def _mark_down() -> None:
+    global _down_until
+    _down_until = time.monotonic() + OUTAGE_BACKOFF
+
+
+def is_available() -> bool:
+    return time.monotonic() >= _down_until
+
+
+def init_db() -> None:
     global _pool
     if _pool is not None:
         return
-
     _pool = psycopg2.pool.ThreadedConnectionPool(
-        min_conn,
-        max_conn,
+        1,
+        POOL_SIZE,
         host=DB_HOST,
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASSWORD,
+        connect_timeout=CONNECT_TIMEOUT,
+        options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
     )
-
     _apply_migrations()
 
 
 def _apply_migrations() -> None:
-    """Apply numbered SQL files from migrations/ that are not yet recorded in schema_migrations."""
     files = sorted(f for f in os.listdir(MIGRATIONS_DIR) if f.endswith(".sql"))
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -71,19 +100,44 @@ def close_db() -> None:
         logger.info("Database pool closed")
 
 
+def _rollback(conn) -> bool:
+    try:
+        conn.rollback()
+        return True
+    except psycopg2.Error:
+        return False
+
+
 @contextmanager
 def get_conn():
-    """Borrow a connection from the pool (auto-return on exit)."""
     if _pool is None:
-        raise RuntimeError("Database pool is not initialized — call init_db() first")
-    conn = _pool.getconn()
+        raise RuntimeError("Database pool is not initialized, call init_db() first")
+    if not is_available():
+        raise DatabaseUnavailable("database is unreachable, will retry shortly")
+    if not _slots.acquire(timeout=POOL_WAIT):
+        raise DatabaseBusy("all database connections are busy")
     try:
-        yield conn
-    except Exception:
-        conn.rollback()
-        raise
+        try:
+            conn = _pool.getconn()
+        except psycopg2.OperationalError:
+            _mark_down()
+            raise
+        broken = False
+        try:
+            yield conn
+        except Exception:
+            broken = not _rollback(conn) or bool(conn.closed)
+            if broken:
+                _mark_down()
+            raise
+        finally:
+            _pool.putconn(conn, close=broken or bool(conn.closed))
     finally:
-        _pool.putconn(conn)
+        _slots.release()
+
+
+def _dict_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def log_event(
@@ -105,6 +159,25 @@ def log_event(
         logger.error("Failed to log event to DB: %s", e)
 
 
+def kv_get(key: str, default: Any = None) -> Any:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT value FROM kv_state WHERE key = %s", (key,))
+        row = cur.fetchone()
+    return row[0] if row else default
+
+
+def kv_set(key: str, value: Any) -> None:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO kv_state (key, value, updated_at) VALUES (%s, %s, now())
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",
+            (key, psycopg2.extras.Json(value)),
+        )
+        conn.commit()
+
+
+# uptime
+
 def save_uptime_check(
     site_url: str,
     status: str,
@@ -121,31 +194,41 @@ def save_uptime_check(
         conn.commit()
 
 
-def get_uptime_stats(site_url: str) -> dict[str, Any]:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT * FROM v_uptime_stats WHERE site_url = %s", (site_url,))
-        row = cur.fetchone()
-        if row:
-            return dict(row)
-    return {
-        "site_url": site_url,
-        "total_checks": 0,
-        "successful_checks": 0,
-        "failed_checks": 0,
-        "uptime_percentage": 100.0,
-        "last_status": "unknown",
-        "last_check": None,
-    }
+def last_uptime_status() -> dict[str, str]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT DISTINCT ON (site_url) site_url, status
+               FROM uptime_checks
+               WHERE checked_at > now() - interval '7 days'
+               ORDER BY site_url, checked_at DESC"""
+        )
+        return dict(cur.fetchall())
 
 
-def get_all_uptime_stats() -> list[dict]:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT * FROM v_uptime_stats ORDER BY site_url")
-        return [dict(r) for r in cur.fetchall()]
+def uptime_window(hours: int, site_url: str | None = None) -> dict[str, dict]:
+    """Per-site check counts and uptime percent over the last `hours`."""
+    with get_conn() as conn, _dict_cursor(conn) as cur:
+        cur.execute(
+            """SELECT site_url,
+                      count(*)                                  AS checks,
+                      count(*) FILTER (WHERE status = 'online') AS ok,
+                      avg(response_time) FILTER (WHERE status = 'online') AS avg_response
+               FROM uptime_checks
+               WHERE checked_at > now() - make_interval(hours => %s)
+                 AND (%s::text IS NULL OR site_url = %s)
+               GROUP BY site_url""",
+            (hours, site_url, site_url),
+        )
+        result = {}
+        for row in cur.fetchall():
+            row = dict(row)
+            row["percent"] = row["ok"] / row["checks"] * 100 if row["checks"] else None
+            result[row["site_url"]] = row
+        return result
 
 
 def get_recent_uptime_checks(site_url: str, limit: int = 5) -> list[dict]:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with get_conn() as conn, _dict_cursor(conn) as cur:
         cur.execute(
             """SELECT status, status_code, response_time, error, checked_at
                FROM uptime_checks WHERE site_url = %s
@@ -155,69 +238,69 @@ def get_recent_uptime_checks(site_url: str, limit: int = 5) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-def open_downtime_incident(site_url: str) -> int:
-    """Start a new downtime incident, return its id."""
+def get_open_incidents() -> dict[str, dict]:
+    with get_conn() as conn, _dict_cursor(conn) as cur:
+        cur.execute(
+            "SELECT id, site_url, started_at, alert_sent FROM downtime_incidents WHERE ended_at IS NULL"
+        )
+        return {r["site_url"]: dict(r) for r in cur.fetchall()}
+
+
+def open_downtime_incident(site_url: str, started_at: datetime) -> int:
+    """Open an incident or return the one that is already open for this site."""
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO downtime_incidents (site_url) VALUES (%s) RETURNING id""",
-            (site_url,),
+            """INSERT INTO downtime_incidents (site_url, started_at) VALUES (%s, %s)
+               ON CONFLICT (site_url) WHERE ended_at IS NULL DO NOTHING
+               RETURNING id""",
+            (site_url, started_at),
         )
         row = cur.fetchone()
+        if row is None:
+            cur.execute(
+                "SELECT id FROM downtime_incidents WHERE site_url = %s AND ended_at IS NULL",
+                (site_url,),
+            )
+            row = cur.fetchone()
         conn.commit()
         return row[0]
 
 
 def close_downtime_incident(site_url: str) -> timedelta | None:
-    """Close the open incident for a site, return how long it lasted."""
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """UPDATE downtime_incidents
                SET ended_at = now()
                WHERE site_url = %s AND ended_at IS NULL
-               RETURNING ended_at - started_at AS dur""",
+               RETURNING ended_at - started_at""",
             (site_url,),
         )
         row = cur.fetchone()
         conn.commit()
-        if row and row[0] is not None:
-            return row[0]
-    return None
-
-
-def get_open_incident(site_url: str) -> dict | None:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """SELECT * FROM downtime_incidents
-               WHERE site_url = %s AND ended_at IS NULL
-               ORDER BY started_at DESC LIMIT 1""",
-            (site_url,),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
+    return row[0] if row else None
 
 
 def mark_incident_alerted(incident_id: int) -> None:
-    """Remember that the DOWN alert for this incident was actually delivered."""
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("UPDATE downtime_incidents SET alert_sent = TRUE WHERE id = %s", (incident_id,))
         conn.commit()
 
 
-def count_downtime_incidents(site_url: str) -> int:
+def count_downtime_incidents(site_url: str, days: int) -> int:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT count(*) FROM downtime_incidents WHERE site_url = %s",
-            (site_url,),
+            """SELECT count(*) FROM downtime_incidents
+               WHERE site_url = %s AND alert_sent AND started_at > now() - make_interval(days => %s)""",
+            (site_url, days),
         )
         return cur.fetchone()[0]
 
 
+# warmup
+
 def start_warmup_run(site_url: str) -> int:
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO warmup_runs (site_url) VALUES (%s) RETURNING id",
-            (site_url,),
-        )
+        cur.execute("INSERT INTO warmup_runs (site_url) VALUES (%s) RETURNING id", (site_url,))
         row = cur.fetchone()
         conn.commit()
         return row[0]
@@ -243,11 +326,11 @@ def finish_warmup_run(
 
 
 def get_warmup_stats(site_url: str) -> dict[str, Any]:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with get_conn() as conn, _dict_cursor(conn) as cur:
         cur.execute("SELECT * FROM v_warmup_stats WHERE site_url = %s", (site_url,))
         row = cur.fetchone()
-        if row:
-            return dict(row)
+    if row:
+        return dict(row)
     return {
         "site_url": site_url,
         "total_runs": 0,
@@ -259,10 +342,12 @@ def get_warmup_stats(site_url: str) -> dict[str, Any]:
 
 
 def get_all_warmup_stats() -> list[dict]:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with get_conn() as conn, _dict_cursor(conn) as cur:
         cur.execute("SELECT * FROM v_warmup_stats ORDER BY site_url")
         return [dict(r) for r in cur.fetchall()]
 
+
+# domains
 
 def save_domain_check(
     domain_name: str,
@@ -293,30 +378,41 @@ def save_domain_check(
 
 
 def get_latest_domain_info(domain_name: str) -> dict | None:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            "SELECT * FROM v_domain_latest WHERE domain_name = %s",
-            (domain_name,),
-        )
+    with get_conn() as conn, _dict_cursor(conn) as cur:
+        cur.execute("SELECT * FROM v_domain_latest WHERE domain_name = %s", (domain_name,))
         row = cur.fetchone()
         return dict(row) if row else None
 
 
 def get_all_domains_latest() -> list[dict]:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with get_conn() as conn, _dict_cursor(conn) as cur:
         cur.execute("SELECT * FROM v_domain_latest ORDER BY domain_name")
         return [dict(r) for r in cur.fetchall()]
 
 
-def should_send_domain_alert(domain_name: str, alert_level: int) -> bool:
-    """Check if we already sent an alert for this domain at this threshold."""
+def domain_error_streak(domain_name: str, limit: int) -> int:
+    """How many of the latest checks in a row gave no expiry date (looks at most `limit` back)."""
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            """SELECT 1 FROM domain_alerts
-               WHERE domain_name = %s AND alert_level = %s""",
+            """SELECT alert_status FROM domain_checks
+               WHERE domain_name = %s ORDER BY checked_at DESC LIMIT %s""",
+            (domain_name, limit),
+        )
+        streak = 0
+        for (status,) in cur.fetchall():
+            if status not in ("error", "unknown"):
+                break
+            streak += 1
+        return streak
+
+
+def should_send_domain_alert(domain_name: str, alert_level: int) -> bool:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM domain_alerts WHERE domain_name = %s AND alert_level = %s",
             (domain_name, alert_level),
         )
-        return cur.fetchone() is None  # True = NOT yet sent
+        return cur.fetchone() is None
 
 
 def record_domain_alert(domain_name: str, alert_level: int) -> None:
@@ -330,12 +426,24 @@ def record_domain_alert(domain_name: str, alert_level: int) -> None:
         conn.commit()
 
 
-def reset_domain_alerts(domain_name: str) -> None:
-    """Forget sent alerts after a renewal."""
+def clear_domain_alert(domain_name: str, alert_level: int) -> bool:
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM domain_alerts WHERE domain_name = %s", (domain_name,))
+        cur.execute(
+            "DELETE FROM domain_alerts WHERE domain_name = %s AND alert_level = %s",
+            (domain_name, alert_level),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def reset_domain_alerts(domain_name: str) -> None:
+    """Forget expiry alerts after a renewal (the lookup-failure marker stays)."""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM domain_alerts WHERE domain_name = %s AND alert_level >= 0", (domain_name,))
         conn.commit()
 
+
+# metrics
 
 def save_host_metrics(m: dict) -> None:
     with get_conn() as conn, conn.cursor() as cur:
@@ -348,8 +456,7 @@ def save_host_metrics(m: dict) -> None:
 
 
 def get_host_metrics_summary(hours: int = 24) -> dict | None:
-    """Average / peak values over the last `hours` hours."""
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with get_conn() as conn, _dict_cursor(conn) as cur:
         cur.execute(
             """SELECT count(*)            AS samples,
                       avg(cpu_percent)    AS cpu_avg,  max(cpu_percent)  AS cpu_max,
@@ -364,7 +471,6 @@ def get_host_metrics_summary(hours: int = 24) -> dict | None:
 
 
 def save_container_metrics(rows: list[dict]) -> None:
-    """Bulk-insert one row per container (stats may be missing for stopped ones)."""
     if not rows:
         return
     values = []
@@ -388,7 +494,7 @@ def save_container_metrics(rows: list[dict]) -> None:
 
 
 def get_container_metrics_summary(name: str, hours: int = 24) -> dict | None:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with get_conn() as conn, _dict_cursor(conn) as cur:
         cur.execute(
             """SELECT count(cpu_percent)   AS samples,
                       avg(cpu_percent)     AS cpu_avg,  max(cpu_percent)  AS cpu_max,
@@ -403,74 +509,39 @@ def get_container_metrics_summary(name: str, hours: int = 24) -> dict | None:
         return dict(row) if row and row["samples"] else None
 
 
-def get_recent_events(
-    category: str | None = None,
-    level: str | None = None,
-    limit: int = 20,
-) -> list[dict]:
-    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        conditions = []
-        params: list = []
-        if category:
-            conditions.append("category = %s")
-            params.append(category)
-        if level:
-            conditions.append("level = %s")
-            params.append(level)
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        cur.execute(
-            f"SELECT * FROM bot_events {where} ORDER BY created_at DESC LIMIT %s",
-            params + [limit],
-        )
-        return [dict(r) for r in cur.fetchall()]
+# housekeeping
 
-
-def get_last_check_times() -> dict[str, datetime | None]:
-    """Return timestamps of the last uptime check, warmup run, and domain check."""
-    result: dict[str, datetime | None] = {
-        "uptime": None,
-        "warmup": None,
-        "domain": None,
-    }
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT max(checked_at) FROM uptime_checks")
-        row = cur.fetchone()
-        if row and row[0]:
-            result["uptime"] = row[0]
-
-        cur.execute("SELECT max(finished_at) FROM warmup_runs")
-        row = cur.fetchone()
-        if row and row[0]:
-            result["warmup"] = row[0]
-
-        cur.execute("SELECT max(checked_at) FROM domain_checks")
-        row = cur.fetchone()
-        if row and row[0]:
-            result["domain"] = row[0]
-    return result
-
-
-def cleanup_old_records(days: int = 30) -> dict[str, int]:
-    """Delete records older than `days` from large tables. Returns row counts."""
-    deleted: dict[str, int] = {}
-    tables = [
-        ("uptime_checks", "checked_at"),
-        ("warmup_runs", "started_at"),
-        ("domain_checks", "checked_at"),
-        ("bot_events", "created_at"),
-        ("host_metrics", "recorded_at"),
-        ("container_metrics", "recorded_at"),
-    ]
-    with get_conn() as conn, conn.cursor() as cur:
-        for table, col in tables:
+def _delete_older_than(table: str, column: str, days: int) -> int:
+    total = 0
+    while True:
+        with get_conn() as conn, conn.cursor() as cur:
             cur.execute(
-                f"DELETE FROM {table} WHERE {col} < now() - make_interval(days => %s)",
-                (days,),
+                f"""DELETE FROM {table} WHERE ctid IN (
+                        SELECT ctid FROM {table}
+                        WHERE {column} < now() - make_interval(days => %s)
+                        LIMIT %s)""",
+                (days, CLEANUP_BATCH),
             )
-            deleted[table] = cur.rowcount
-        conn.commit()
+            deleted = cur.rowcount
+            conn.commit()
+        total += deleted
+        if deleted < CLEANUP_BATCH:
+            return total
+
+
+def cleanup_old_records(days: int, metrics_days: int) -> dict[str, int]:
+    """Delete old rows in small batches so no single statement hits the timeout."""
+    tables = [
+        ("uptime_checks", "checked_at", days),
+        ("warmup_runs", "started_at", days),
+        ("domain_checks", "checked_at", days),
+        ("bot_events", "created_at", days),
+        ("host_metrics", "recorded_at", metrics_days),
+        ("container_metrics", "recorded_at", metrics_days),
+    ]
+    deleted = {table: _delete_older_than(table, column, keep) for table, column, keep in tables}
     total = sum(deleted.values())
-    if total > 0:
-        log_event("INFO", "system", f"Log rotation: deleted {total} old records ({days}d)")
-    logger.info("Log rotation (%dd): %s", days, deleted)
+    if total:
+        log_event("INFO", "system", f"Cleanup: deleted {total} old rows")
+    logger.info("Cleanup: %s", deleted)
     return deleted

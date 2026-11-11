@@ -7,6 +7,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: moon_watcher_test
+          POSTGRES_USER: watcher
+          POSTGRES_PASSWORD: watcher
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U watcher"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DB_HOST: 127.0.0.1
+      TEST_DB_PORT: "5432"
+      TEST_DB_USER: watcher
+      TEST_DB_PASSWORD: watcher
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Sustained-threshold tracking: fire once after N consecutive breaches, recover once."""
 
 import threading
@@ -43,3 +42,12 @@ class SustainedThreshold:
             for k in [k for k in self._count if k not in valid_keys]:
                 del self._count[k]
             self._alerted &= valid_keys
+
+    def alerted(self) -> list[str]:
+        with self._lock:
+            return sorted(self._alerted)
+
+    def restore(self, keys) -> None:
+        """Bring back the "already alerted" keys after a restart, so recoveries still get reported."""
+        with self._lock:
+            self._alerted = set(keys or [])

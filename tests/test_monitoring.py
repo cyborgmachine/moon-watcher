@@ -1,5 +1,6 @@
 """Unit tests for the Docker / host monitoring logic (no Docker daemon or DB needed)."""
 
+import copy
 import os
 from unittest import mock
 
@@ -55,8 +56,9 @@ def test_empty_payload_does_not_crash():
     assert s["cpu_percent"] == 0.0 and s["mem_percent"] == 0.0
 
 
-def info(state="running", health=None, exit_code=0, policy="always", name="web", started="t1", oom=False):
-    return {"id": "abc123", "name": name, "image": "img", "state": state, "health": health,
+def info(state="running", health=None, exit_code=0, policy="always", name="web", started="t1", oom=False,
+         cid="abc123"):
+    return {"id": cid, "name": name, "image": "img", "state": state, "health": health,
             "exit_code": exit_code, "oom": oom, "restart_count": 0, "restart_policy": policy,
             "started_at": started, "cpu_limit": None, "stats": None}
 
@@ -101,23 +103,59 @@ def test_fire_repeats_until_marked_delivered():
 class FakeNotifier:
     def __init__(self):
         self.sent = []
+        self.deliver = True
 
     def send_alert(self, text, site_url="", event_type="generic", cooldown=True):
         self.sent.append((event_type, site_url, text))
-        return True
+        return self.deliver
+
+    def send_alerts(self, alerts):
+        return [self.send_alert(a.text, a.key, a.event, a.cooldown) for a in alerts]
+
+
+class MemoryStore:
+    """Stands in for the kv_state table."""
+
+    def __init__(self):
+        self.data = {}
+
+    def saved(self, key):
+        store = self
+
+        class Saved:
+            def __init__(self, k):
+                self.key = k
+
+            def load(self, default):
+                return store.data.get(self.key, default)
+
+            def save(self, value):
+                store.data[self.key] = copy.deepcopy(value)
+
+        return Saved(key)
+
+
+def run_checks(mon, sequence):
+    it = iter(sequence)
+    mon.snapshot = lambda with_stats=True: next(it)
+    with mock.patch.object(dm.db, "save_container_metrics"), mock.patch.object(dm.db, "log_event"):
+        for _ in sequence:
+            mon.check()
+
+
+def new_monitor(notifier=None, memory=None):
+    memory = memory or MemoryStore()
+    with mock.patch.object(dm, "Saved", memory.saved):
+        mon = DockerMonitor(notifier or FakeNotifier())
+    mon.load_state()
+    return mon, memory
 
 
 def make_monitor(sequence):
     """Monitor whose snapshot() yields the given lists of container infos, one per check."""
-    n = FakeNotifier()
-    with mock.patch.object(dm.db, "save_container_metrics"), mock.patch.object(dm.db, "log_event"):
-        mon = DockerMonitor(n)
-        it = iter(sequence)
-        mon.snapshot = lambda with_stats=True: next(it)
-        for _ in sequence:
-            with mock.patch.object(dm.db, "save_container_metrics"), mock.patch.object(dm.db, "log_event"):
-                mon.check()
-    return n
+    mon, _ = new_monitor()
+    run_checks(mon, sequence)
+    return mon.notifier
 
 
 def types(n):
@@ -132,6 +170,51 @@ def test_down_then_recovery_alerts():
 def test_restart_between_checks_is_detected():
     n = make_monitor([[info(started="t1")], [info(started="t2")]])
     assert types(n) == ["container_restart"]
+
+
+def test_recreated_container_is_not_a_restart():
+    n = make_monitor([[info(started="t1")], [info(started="t2", cid="def456")]])
+    assert types(n) == []
+
+
+def test_undelivered_down_alert_is_retried():
+    mon, _ = new_monitor()
+    mon.notifier.deliver = False
+    run_checks(mon, [[info()], [info("exited", exit_code=1)]])
+    mon.notifier.deliver = True
+    run_checks(mon, [[info("exited", exit_code=1)], [info("exited", exit_code=1)]])
+    assert types(mon.notifier) == ["container_down", "container_down"]
+
+
+def test_no_repeat_alert_after_bot_restart():
+    mon, memory = new_monitor()
+    run_checks(mon, [[info()], [info("exited", exit_code=1)]])
+    restarted, _ = new_monitor(memory=memory)
+    run_checks(restarted, [[info("exited", exit_code=1)], [info()]])
+    assert types(mon.notifier) == ["container_down"]
+    assert types(restarted.notifier) == ["container_recovery"]
+
+
+def test_restart_while_bot_was_offline_is_reported():
+    mon, memory = new_monitor()
+    run_checks(mon, [[info(started="t1")]])
+    restarted, _ = new_monitor(memory=memory)
+    run_checks(restarted, [[info(started="t2")]])
+    assert types(restarted.notifier) == ["container_restart"]
+
+
+def test_resource_recovery_after_bot_restart():
+    def hot(cpu):
+        i = info()
+        i["stats"] = {"cpu_percent": cpu, "cpu_load": cpu, "mem_used": 1, "mem_limit": 100,
+                      "mem_percent": 1.0, "net_rx": 0, "net_tx": 0, "pids": 1}
+        return [i]
+    mon, memory = new_monitor()
+    run_checks(mon, [hot(95), hot(96), hot(97)])
+    restarted, _ = new_monitor(memory=memory)
+    run_checks(restarted, [hot(5)])
+    assert types(mon.notifier) == ["cpu_high"]
+    assert types(restarted.notifier) == ["cpu_ok"]
 
 
 def test_unhealthy_alert():
